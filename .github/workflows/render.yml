@@ -1,0 +1,93 @@
+name: render
+run-name: render ${{ inputs.run_key }}
+on:
+  workflow_dispatch:
+    inputs:
+      payload_b64:
+        description: "base64 JSON"
+        required: true
+      run_key:
+        required: true
+permissions:
+  contents: write
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install tools
+        timeout-minutes: 6
+        run: |
+          set -e
+          # jq обычно уже есть на раннере
+          command -v jq >/dev/null 2>&1 || NEED_JQ=1
+
+          if command -v ffmpeg >/dev/null 2>&1 && [ -z "$NEED_JQ" ]; then
+            echo "ffmpeg и jq уже установлены"
+            exit 0
+          fi
+
+          # 1) Быстрая попытка через apt с жёстким лимитом времени
+          if timeout 150 sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update \
+             && timeout 150 sudo apt-get install -y --no-install-recommends ffmpeg jq; then
+            echo "Установлено через apt"
+          else
+            echo "apt завис или упал, ставлю статический ffmpeg"
+            # 2) Запасной вариант: статическая сборка ffmpeg
+            curl -fsSL --retry 3 --max-time 120 \
+              https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz
+            mkdir -p /tmp/ffmpeg && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1
+            sudo cp /tmp/ffmpeg/ffmpeg /tmp/ffmpeg/ffprobe /usr/local/bin/
+            if ! command -v jq >/dev/null 2>&1; then
+              sudo curl -fsSL --retry 3 --max-time 60 \
+                https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 -o /usr/local/bin/jq
+              sudo chmod +x /usr/local/bin/jq
+            fi
+          fi
+          ffmpeg -version | head -n1
+          jq --version
+      - name: Decode payload
+        run: |
+          mkdir work
+          echo '${{ inputs.payload_b64 }}' | base64 -d > work/payload.json
+      - name: Fetch files
+        timeout-minutes: 10
+        run: |
+          cd work
+          jq -r '.script' payload.json > run.sh
+          jq -c '.files[]' payload.json | while read -r f; do
+            curl -fsSL --retry 3 --max-time 300 "$(echo "$f" | jq -r .url)" -o "$(echo "$f" | jq -r .name)"
+          done
+          TAG=$(jq -r '.release_tag' payload.json)
+          for n in $(jq -r '.release_files[]' payload.json); do
+            gh release download "$TAG" -R "${{ github.repository }}" -p "$n" -D .
+          done
+      - name: Render
+        run: cd work && bash run.sh
+      - name: Save to release
+        run: |
+          cd work
+          TAG=$(jq -r '.release_tag' payload.json)
+          OUT=$(jq -r '.out' payload.json)
+          DELIVER=$(jq -r '.deliver' payload.json)
+          if [ "$DELIVER" != "true" ]; then
+            gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1 || \
+              gh release create "$TAG" -R "${{ github.repository }}" --title "$TAG" --notes "render temp" --prerelease
+            gh release upload "$TAG" "$OUT" -R "${{ github.repository }}" --clobber
+          fi
+      - name: Output
+        run: |
+          cd work
+          if [ "$(jq -r '.deliver' payload.json)" = "true" ]; then
+            OUT=$(jq -r '.out' payload.json)
+            mkdir ../result && cp "$OUT" ../result/
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.payload_b64 != '') && hashFiles('result/*') != '' }}
+        with:
+          name: render-${{ inputs.run_key }}
+          path: result/*
+          retention-days: 1
